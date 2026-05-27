@@ -1,0 +1,10 @@
+{
+  "wren": {
+    "baseUrl": "http://localhost:5555",
+    "uiGraphqlUrl": "http://localhost:3000/api/graphql",
+    "projectId": "2",
+    "deployId": "1d2fe3bbc0bb3b68c8ccce138f5a8e6fa0895dca",
+    "language": "English",
+    "timezoneName": "UTC"
+  }
+}

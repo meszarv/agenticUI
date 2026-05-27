@@ -1,0 +1,63 @@
+export type RuntimeAppConfig = {
+  wren: {
+    baseUrl: string;
+    uiGraphqlUrl: string;
+    projectId: string | null;
+    deployId: string;
+    language: string;
+    timezoneName: string;
+    hasDeployId: boolean;
+    hasMdlApi: boolean;
+  };
+};
+
+export type AskCandidate = {
+  sql: string;
+  type: string;
+};
+
+export type AskResult = {
+  queryId: string;
+  status: string;
+  type?: string;
+  candidates: AskCandidate[];
+  reasoning?: string;
+  retrievedTables?: string[];
+};
+
+export type ChartResult = {
+  queryId: string;
+  status: string;
+  chartType?: string;
+  chartSchema?: Record<string, unknown>;
+  reasoning?: string;
+};
+
+export type DashboardWidget = {
+  title: string;
+  question: string;
+  sql: string;
+  chartType?: string;
+  chartSchema?: Record<string, unknown>;
+  reasoning?: string;
+  category?: string;
+};
+
+export type ClosestQuery = {
+  question: string;
+  sql: string;
+  category?: string;
+  description: string;
+  retrievedTables?: string[];
+};
+
+export type GenerateDashboardResponse = {
+  ask: AskResult;
+  recommendations: Array<{
+    question: string;
+    category: string;
+    sql: string;
+  }>;
+  widgets: DashboardWidget[];
+  closestQueries: ClosestQuery[];
+};
