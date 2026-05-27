@@ -1,6 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 import { VegaEmbed } from 'react-vega';
+import { Renderer } from '@openuidev/react-lang';
+import { ThemeProvider, openuiLibrary } from '@openuidev/react-ui';
 import { generateDashboard, getRuntimeConfig } from './api';
 import { GenerateDashboardResponse, RuntimeAppConfig } from './types';
 
@@ -205,31 +207,53 @@ export default function App() {
                 </div>
               ) : null}
 
-              <div className="widgets">
-                {result.widgets.map((widget, index) => (
-                  <article className="widget" key={`${widget.sql}-${index}`}>
-                    <header>
-                      <h3>{widget.title || `Widget ${index + 1}`}</h3>
-                      {widget.category ? <span className="pill">{widget.category}</span> : null}
-                    </header>
-                    <p className="question">{widget.question}</p>
-                    {widget.chartSchema ? (
-                      <div className="chart-frame">
-                        <VegaEmbed
-                          spec={widget.chartSchema as any}
-                          options={{ actions: false, renderer: 'svg' }}
-                        />
-                      </div>
-                    ) : (
-                      <p className="muted">No chart schema available for this widget.</p>
-                    )}
-                    <details>
-                      <summary>SQL</summary>
-                      <pre>{widget.sql}</pre>
-                    </details>
-                  </article>
-                ))}
-              </div>
+              <ThemeProvider mode="light" cssSelector=".openui-light-scope">
+                <div className="widgets openui-light-scope">
+                  {result.widgets.map((widget, index) => (
+                    <article className="widget" key={`${widget.sql}-${index}`}>
+                      <header>
+                        <h3>{widget.title || `Widget ${index + 1}`}</h3>
+                        {widget.category ? <span className="pill">{widget.category}</span> : null}
+                      </header>
+                      <p className="question">{widget.question}</p>
+                      {widget.chartSchema ? (
+                        <div className="chart-frame">
+                          <VegaEmbed
+                            spec={widget.chartSchema as any}
+                            options={{ actions: false, renderer: 'svg' }}
+                          />
+                        </div>
+                      ) : widget.openUiLang ? (
+                        <div className="chart-frame">
+                          <Renderer
+                            library={openuiLibrary}
+                            response={widget.openUiLang}
+                            isStreaming={false}
+                          />
+                        </div>
+                      ) : (
+                        <p className="muted">No chart schema available for this widget.</p>
+                      )}
+                      {widget.dataPreview ? (
+                        <details>
+                          <summary>Data Preview</summary>
+                          <pre>{JSON.stringify(widget.dataPreview, null, 2)}</pre>
+                        </details>
+                      ) : null}
+                      {widget.openUiLang ? (
+                        <details>
+                          <summary>OpenUI Lang</summary>
+                          <pre>{widget.openUiLang}</pre>
+                        </details>
+                      ) : null}
+                      <details>
+                        <summary>SQL</summary>
+                        <pre>{widget.sql}</pre>
+                      </details>
+                    </article>
+                  ))}
+                </div>
+              </ThemeProvider>
             </>
           )}
         </section>

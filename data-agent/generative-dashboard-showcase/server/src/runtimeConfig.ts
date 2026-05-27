@@ -73,6 +73,7 @@ export const loadRuntimeConfig = (): RuntimeConfig => {
 
 export const toWrenConnection = (config: RuntimeConfig): WrenConnection => ({
   baseUrl: config.wren.baseUrl,
+  uiGraphqlUrl: config.wren.uiGraphqlUrl,
   projectId: config.wren.projectId,
   language: config.wren.language,
   timezoneName: config.wren.timezoneName,

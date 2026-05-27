@@ -36,8 +36,8 @@ npm run dev
 ```
 
 Default ports:
-- BFF: `http://localhost:4100`
-- Web: `http://localhost:4173`
+- BFF: `http://0.0.0.0:4100` (reachable on host LAN IP)
+- Web: `http://0.0.0.0:4173` (reachable on host LAN IP)
 
 ## Configure
 
@@ -57,7 +57,13 @@ cp server/config.json.example server/config.json
 - `wren.language`, `wren.timezoneName`
 
 3. Optional: override config values via `server/.env` (env wins over `config.json`):
-- `WREN_BASE_URL`, `WREN_UI_GRAPHQL_URL`, `WREN_PROJECT_ID`, `WREN_DEPLOY_ID`, `WREN_LANGUAGE`, `WREN_TIMEZONE_NAME`
+- `HOST`, `PORT`, `WREN_BASE_URL`, `WREN_UI_GRAPHQL_URL`, `WREN_PROJECT_ID`, `WREN_DEPLOY_ID`, `WREN_LANGUAGE`, `WREN_TIMEZONE_NAME`
+
+Network notes:
+- Web dev server binds to `0.0.0.0` by default.
+- BFF binds to `0.0.0.0` by default.
+- Frontend BFF URL defaults to `http://<current-ui-hostname>:4100`.
+- If `wren.baseUrl` or `wren.uiGraphqlUrl` use `localhost`/`127.0.0.1`, they are reachable only from the machine running the BFF.
 
 4. MDL handling:
 - The app can pull MDL automatically from Wren API (`getMDL`) using configured deploy hash.

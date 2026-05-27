@@ -41,6 +41,11 @@ export type DashboardWidget = {
   chartSchema?: Record<string, unknown>;
   reasoning?: string;
   category?: string;
+  openUiLang?: string;
+  dataPreview?: {
+    columns: Array<{ name: string; type?: string | null }>;
+    data: unknown[][];
+  };
 };
 
 export type ClosestQuery = {

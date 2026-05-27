@@ -1,7 +1,9 @@
 import axios, { AxiosError, AxiosInstance } from 'axios';
+import { openuiLibrary, openuiPromptOptions } from '@openuidev/react-ui';
 
 export type WrenConnection = {
   baseUrl: string;
+  uiGraphqlUrl?: string;
   projectId?: string;
   language?: string;
   timezoneName?: string;
@@ -47,6 +49,8 @@ export type DashboardWidget = {
   chartSchema?: Record<string, unknown>;
   reasoning?: string;
   category?: string;
+  openUiLang?: string;
+  dataPreview?: SqlDataPreview;
 };
 
 export type ClosestQuery = {
@@ -55,6 +59,11 @@ export type ClosestQuery = {
   category?: string;
   description: string;
   retrievedTables?: string[];
+};
+
+export type SqlDataPreview = {
+  columns: Array<{ name: string; type?: string | null }>;
+  data: unknown[][];
 };
 
 export type GenerateDashboardInput = {
@@ -108,6 +117,188 @@ const getConfigurations = (connection: WrenConnection) => ({
   language: connection.language || 'English',
   timezone: { name: connection.timezoneName || 'UTC' },
 });
+
+const OPENUI_SYSTEM_PROMPT = openuiLibrary.prompt(openuiPromptOptions);
+const OPENUI_SQL_ANSWER_INSTRUCTION = `${OPENUI_SYSTEM_PROMPT}
+
+### TASK
+You are generating data UI for a SQL result.
+Return ONLY valid openui-lang.
+Do not include markdown fences or prose outside openui-lang.
+Make a practical UI from the provided rows:
+1. Start with root = Stack(...)
+2. Include a short title.
+3. Include at least one table of the provided rows.
+4. If there is at least one numeric measure and one category field, include a simple chart.
+5. Keep output concise and robust even for small datasets.
+`;
+
+const PREVIEW_SQL_MUTATION = `
+  mutation PreviewSql($data: PreviewSQLDataInput) {
+    previewSql(data: $data)
+  }
+`;
+
+const buildUiGraphqlClient = (uiGraphqlUrl: string): AxiosInstance => {
+  return axios.create({
+    baseURL: uiGraphqlUrl,
+    timeout: 60000,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+};
+
+const previewSqlData = async (input: {
+  connection: WrenConnection;
+  sql: string;
+  limit?: number;
+}): Promise<SqlDataPreview> => {
+  const { connection, sql, limit = 200 } = input;
+  if (!connection.uiGraphqlUrl) {
+    throw new WrenError('Wren UI GraphQL URL is required to preview SQL data');
+  }
+
+  const client = buildUiGraphqlClient(connection.uiGraphqlUrl);
+  const variables = {
+    data: {
+      sql,
+      projectId: connection.projectId || undefined,
+      limit,
+      dryRun: false,
+    },
+  };
+
+  try {
+    const res = await client.post('', {
+      query: PREVIEW_SQL_MUTATION,
+      variables,
+    });
+    if (Array.isArray(res.data?.errors) && res.data.errors.length) {
+      throw new WrenError(
+        `Wren UI GraphQL previewSql failed: ${res.data.errors
+          .map((item: { message?: string }) => item?.message || 'Unknown error')
+          .join('; ')}`,
+      );
+    }
+    const payload = res.data?.data?.previewSql as
+      | {
+          columns?: Array<{ name?: string; type?: string | null }>;
+          data?: unknown[][];
+        }
+      | undefined;
+    const columns = payload?.columns ?? [];
+    const data = payload?.data ?? [];
+
+    if (!Array.isArray(columns) || !Array.isArray(data)) {
+      throw new WrenError('previewSql did not return expected columns/data payload');
+    }
+
+    return {
+      columns: columns.map((col) => ({
+        name: String(col?.name ?? ''),
+        type: col?.type ?? null,
+      })),
+      data,
+    };
+  } catch (error) {
+    throw new WrenError(`Failed to preview SQL data: ${errorMessage(error)}`);
+  }
+};
+
+const extractSseMessages = (raw: string) => {
+  if (!raw.trim()) {
+    return '';
+  }
+
+  const chunks: string[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) {
+      continue;
+    }
+    const payload = trimmed.slice(5).trim();
+    if (!payload) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(payload) as { message?: string };
+      if (typeof parsed.message === 'string') {
+        chunks.push(parsed.message);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return chunks.join('');
+};
+
+const generateOpenUiLangFromSql = async (input: {
+  connection: WrenConnection;
+  question: string;
+  sql: string;
+}): Promise<{ openUiLang: string; dataPreview: SqlDataPreview }> => {
+  const { connection, question, sql } = input;
+  const client = buildClient(connection.baseUrl);
+  const dataPreview = await previewSqlData({
+    connection,
+    sql,
+  });
+
+  const sqlData = {
+    columns: dataPreview.columns.map((col) => ({
+      name: col.name,
+      type: col.type ?? undefined,
+    })),
+    data: dataPreview.data,
+  };
+
+  try {
+    const create = await client.post('/v1/sql-answers', {
+      query: question,
+      sql,
+      sql_data: sqlData,
+      custom_instruction: OPENUI_SQL_ANSWER_INSTRUCTION,
+      project_id: connection.projectId,
+      configurations: getConfigurations(connection),
+      request_from: 'api',
+    });
+
+    const queryId = create.data?.query_id as string;
+    if (!queryId) {
+      throw new WrenError('SQL answer generation did not return query_id');
+    }
+
+    await pollStatus(
+      async () => {
+        const res = await client.get(`/v1/sql-answers/${queryId}`);
+        return res.data as {
+          status: string;
+          error?: { message?: string };
+        };
+      },
+      (payload) => payload.status,
+      'SQL answer',
+    );
+
+    const stream = await client.get(`/v1/sql-answers/${queryId}/streaming`, {
+      responseType: 'text',
+    });
+
+    const openUiLang = extractSseMessages(String(stream.data ?? '')).trim();
+    if (!openUiLang) {
+      throw new WrenError('SQL answer streaming did not return OpenUI content');
+    }
+
+    return {
+      openUiLang,
+      dataPreview,
+    };
+  } catch (error) {
+    throw new WrenError(`Failed to generate OpenUI lang: ${errorMessage(error)}`);
+  }
+};
 
 const pollStatus = async <T>(
   fetcher: () => Promise<T>,
@@ -468,21 +659,49 @@ export const generateDashboard = async (
     throw new WrenError('No SQL candidates returned from ask endpoint', ask.raw);
   }
 
-  const baseChart = await generateChart({
-    connection,
-    question: primaryQuestion,
-    sql: primarySql,
-  });
+  let baseChart: ChartResult | undefined;
+  let baseOpenUi:
+    | {
+        openUiLang: string;
+        dataPreview: SqlDataPreview;
+      }
+    | undefined;
+  try {
+    baseChart = await generateChart({
+      connection,
+      question: primaryQuestion,
+      sql: primarySql,
+    });
+    if (!baseChart.chartSchema) {
+      baseOpenUi = await generateOpenUiLangFromSql({
+        connection,
+        question: primaryQuestion,
+        sql: primarySql,
+      });
+    }
+  } catch {
+    try {
+      baseOpenUi = await generateOpenUiLangFromSql({
+        connection,
+        question: primaryQuestion,
+        sql: primarySql,
+      });
+    } catch {
+      baseOpenUi = undefined;
+    }
+  }
 
   const widgets: DashboardWidget[] = [
     {
       title: primaryQuestion,
       question: primaryQuestion,
       sql: primarySql,
-      chartType: baseChart.chartType,
-      chartSchema: baseChart.chartSchema,
-      reasoning: baseChart.reasoning,
+      chartType: baseChart?.chartType,
+      chartSchema: baseChart?.chartSchema,
+      reasoning: baseChart?.reasoning,
       category: primaryCategory,
+      openUiLang: baseOpenUi?.openUiLang,
+      dataPreview: baseOpenUi?.dataPreview,
     },
   ];
 
@@ -506,6 +725,23 @@ export const generateDashboard = async (
           question: rec.question,
           sql: rec.sql,
         });
+        let openUi:
+          | {
+              openUiLang: string;
+              dataPreview: SqlDataPreview;
+            }
+          | undefined;
+        if (!chart.chartSchema) {
+          try {
+            openUi = await generateOpenUiLangFromSql({
+              connection,
+              question: rec.question,
+              sql: rec.sql,
+            });
+          } catch {
+            openUi = undefined;
+          }
+        }
         widgets.push({
           title: rec.question,
           question: rec.question,
@@ -514,13 +750,32 @@ export const generateDashboard = async (
           chartSchema: chart.chartSchema,
           reasoning: chart.reasoning,
           category: rec.category,
+          openUiLang: openUi?.openUiLang,
+          dataPreview: openUi?.dataPreview,
         });
       } catch {
+        let openUi:
+          | {
+              openUiLang: string;
+              dataPreview: SqlDataPreview;
+            }
+          | undefined;
+        try {
+          openUi = await generateOpenUiLangFromSql({
+            connection,
+            question: rec.question,
+            sql: rec.sql,
+          });
+        } catch {
+          openUi = undefined;
+        }
         widgets.push({
           title: rec.question,
           question: rec.question,
           sql: rec.sql,
           category: rec.category,
+          openUiLang: openUi?.openUiLang,
+          dataPreview: openUi?.dataPreview,
         });
       }
     }

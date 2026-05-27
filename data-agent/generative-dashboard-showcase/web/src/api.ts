@@ -1,8 +1,13 @@
 import axios from 'axios';
 import { GenerateDashboardResponse, RuntimeAppConfig } from './types';
 
+const defaultBffBaseUrl =
+  typeof window !== 'undefined'
+    ? `${window.location.protocol}//${window.location.hostname}:4100`
+    : 'http://localhost:4100';
+
 const BFF_BASE_URL =
-  import.meta.env.VITE_BFF_BASE_URL?.toString() || 'http://localhost:4100';
+  import.meta.env.VITE_BFF_BASE_URL?.toString() || defaultBffBaseUrl;
 
 const client = axios.create({
   baseURL: BFF_BASE_URL,

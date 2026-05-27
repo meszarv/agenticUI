@@ -192,6 +192,10 @@ button.ghost {
   gap: 12px;
 }
 
+.openui-light-scope {
+  color-scheme: light;
+}
+
 .widget {
   border: 1px solid var(--line);
   border-radius: 12px;
