@@ -1,0 +1,56 @@
+# 公司云主机专用 Dockerfile（代理环境）
+#
+# 与原版 Dockerfile 的区别：
+#   - builder/runtime 都加了 HTTP_PROXY build arg
+#   - runtime 用 netcat-openbsd 替代 netcat-traditional（健康检查）
+#   - 降级 qdrant-client==1.12.1（兼容 qdrant v1.17.0）
+#   - apt 需要小写 http_proxy
+#
+# 构建命令：
+#   DOCKER_BUILDKIT=0 docker build \
+#     --build-arg HTTP_PROXY=http://172.17.0.1:3128 \
+#     --build-arg HTTPS_PROXY=http://172.17.0.1:3128 \
+#     -t wrenai-wren-ai-service:latest -f docker/Dockerfile.cloud .
+
+FROM python:3.12.0-bookworm as builder
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install poetry==1.8.3
+
+ENV POETRY_NO_INTERACTION=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=1 \
+    POETRY_VIRTUALENVS_CREATE=1 \
+    POETRY_CACHE_DIR=/tmp/poetry_cache
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+
+RUN poetry install --without dev,eval,test --no-root && rm -rf $POETRY_CACHE_DIR
+# 降级 qdrant-client 解决与 qdrant-haystack 的兼容问题
+RUN /app/.venv/bin/pip install qdrant-client==1.12.1
+
+FROM python:3.12.0-slim-bookworm as runtime
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+# apt 认小写 http_proxy
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+
+# entrypoint.sh 用 nc 做健康检查（bookworm-slim 没有 netcat-traditional）
+RUN apt-get update && apt-get install -y netcat-openbsd && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
+
+COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+
+COPY src src
+COPY entrypoint.sh /app/entrypoint.sh
+COPY pyproject.toml pyproject.toml
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT [ "/app/entrypoint.sh" ]

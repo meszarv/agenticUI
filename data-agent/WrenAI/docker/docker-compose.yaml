@@ -1,0 +1,171 @@
+version: "3"
+
+volumes:
+  data:
+
+networks:
+  wren:
+    driver: bridge
+
+services:
+  bootstrap:
+    image: ghcr.io/canner/wren-bootstrap:${WREN_BOOTSTRAP_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM}
+    environment:
+      DATA_PATH: /app/data
+    volumes:
+      - data:/app/data
+    command: /bin/sh /app/init.sh
+
+  wren-engine:
+    image: ghcr.io/canner/wren-engine:${WREN_ENGINE_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM}
+    # [自定义] 资源限制 — 原版无限制，Mac 上 6 个容器同时跑会吃满内存
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    # [自定义] 只 expose 不 ports — engine 仅供内部服务调用，无需映射到宿主机
+    expose:
+      - ${WREN_ENGINE_PORT}
+      - ${WREN_ENGINE_SQL_PORT}
+    volumes:
+      - data:/usr/src/app/etc
+      - ${PROJECT_DIR}/data:/usr/src/app/data
+    networks:
+      - wren
+    depends_on:
+      - bootstrap
+
+  ibis-server:
+    image: ghcr.io/canner/wren-engine-ibis:${IBIS_SERVER_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM}
+    # [自定义] 资源限制 — ibis 负载低，512M 足够
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    # [自定义] 只 expose 不 ports — 仅供内部服务调用
+    expose:
+      - ${IBIS_SERVER_PORT}
+    environment:
+      WREN_ENGINE_ENDPOINT: http://wren-engine:${WREN_ENGINE_PORT}
+    volumes:
+      - ${LOCAL_STORAGE:-.}:/usr/src/app/data
+    networks:
+      - wren
+
+  wren-ai-service:
+    # [自定义] 本地 build — 二次开发 AI service pipeline
+    # 构建: cd WrenAI/wren-ai-service && docker build -t wrenai-wren-ai-service:latest -f docker/Dockerfile .
+    image: wrenai-wren-ai-service:latest
+    build:
+      context: ../wren-ai-service
+      dockerfile: docker/Dockerfile
+    restart: on-failure
+    platform: ${PLATFORM}
+    # [自定义] 资源限制 — AI service 需要较多内存处理 embedding
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    expose:
+      - ${WREN_AI_SERVICE_PORT}
+    ports:
+      - ${AI_SERVICE_FORWARD_PORT}:${WREN_AI_SERVICE_PORT}
+    environment:
+      # sometimes the console won't show print messages,
+      # using PYTHONUNBUFFERED: 1 can fix this
+      PYTHONUNBUFFERED: 1
+      CONFIG_PATH: /app/config.yaml
+    env_file:
+      - ${PROJECT_DIR}/.env
+    volumes:
+      - ${PROJECT_DIR}/config.yaml:/app/config.yaml:ro
+      - ${PROJECT_DIR}/data:/app/data
+      # [自定义] 挂载 LLM 追踪回调 — 以 sitecustomize.py 方式注入，Python启动时自动加载
+      # 所有 LLM 调用记录写入 /app/data/llm_traces.jsonl，UI 的 Logs 页面读取展示
+      - ${PROJECT_DIR}/trace_callback.py:/app/.venv/lib/python3.12/site-packages/sitecustomize.py:ro
+    networks:
+      - wren
+    depends_on:
+      - qdrant
+
+  qdrant:
+    # v1.17.0 兼容本地 build 的 ai-service 中 qdrant-client 版本
+    image: qdrant/qdrant:v1.17.0
+    restart: on-failure
+    # [自定义] 资源限制 — 14 表向量索引数据量小，512M 足够
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    expose:
+      - 6333
+      - 6334
+    volumes:
+      - data:/qdrant/storage
+    networks:
+      - wren
+
+  wren-ui:
+    # [自定义] 本地 build — 包含 Trace 日志页面等 UI 二次开发改动
+    image: wren-ui-custom:latest
+    build:
+      context: ../wren-ui
+      dockerfile: Dockerfile
+    restart: on-failure
+    platform: ${PLATFORM}
+    # [自定义] 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    environment:
+      DB_TYPE: sqlite
+      # /app is the working directory in the container
+      SQLITE_FILE: /app/data/db.sqlite3
+      WREN_ENGINE_ENDPOINT: http://wren-engine:${WREN_ENGINE_PORT}
+      WREN_AI_ENDPOINT: http://wren-ai-service:${WREN_AI_SERVICE_PORT}
+      IBIS_SERVER_ENDPOINT: http://ibis-server:${IBIS_SERVER_PORT}
+      # this is for telemetry to know the model, i think ai-service might be able to provide a endpoint to get the information
+      GENERATION_MODEL: ${GENERATION_MODEL}
+      # telemetry
+      WREN_ENGINE_PORT: ${WREN_ENGINE_PORT}
+      WREN_AI_SERVICE_VERSION: ${WREN_AI_SERVICE_VERSION}
+      WREN_UI_VERSION: ${WREN_UI_VERSION}
+      WREN_ENGINE_VERSION: ${WREN_ENGINE_VERSION}
+      USER_UUID: ${USER_UUID}
+      POSTHOG_API_KEY: ${POSTHOG_API_KEY}
+      POSTHOG_HOST: ${POSTHOG_HOST}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED}
+      # client side
+      NEXT_PUBLIC_USER_UUID: ${USER_UUID}
+      NEXT_PUBLIC_POSTHOG_API_KEY: ${POSTHOG_API_KEY}
+      NEXT_PUBLIC_POSTHOG_HOST: ${POSTHOG_HOST}
+      NEXT_PUBLIC_TELEMETRY_ENABLED: ${TELEMETRY_ENABLED}
+      EXPERIMENTAL_ENGINE_RUST_VERSION: ${EXPERIMENTAL_ENGINE_RUST_VERSION}
+      # [自定义] 推荐问题开关 — 设为 false 关闭 deploy 后自动生成推荐问题（省 LLM 调用）
+      ENABLE_RECOMMENDATION_QUESTIONS: ${ENABLE_RECOMMENDATION_QUESTIONS:-true}
+      # configs
+      WREN_PRODUCT_VERSION: ${WREN_PRODUCT_VERSION}
+    ports:
+      # HOST_PORT is the port you want to expose to the host machine
+      - ${HOST_PORT}:3000
+    volumes:
+      - data:/app/data
+      # [自定义] 挂载宿主机 data/ 到 /app/llm_data，用于读取 LLM 追踪日志
+      - ${PROJECT_DIR}/data:/app/llm_data:ro
+    networks:
+      - wren
+    depends_on:
+      - wren-ai-service
+      - wren-engine

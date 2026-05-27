@@ -1,0 +1,76 @@
+# 公司云主机专用 Dockerfile（代理环境 + 宿主机预装 node_modules）
+#
+# 与原版 Dockerfile 的区别：
+#   - 禁用 corepack（公司代理 SSL 中间人导致联网失败）
+#   - node_modules 在宿主机用 Node 18 + yarn 预装好后 COPY 进去
+#   - 加 HTTP_PROXY/HTTPS_PROXY build arg
+#   - NODE_TLS_REJECT_UNAUTHORIZED=0（绕过 SSL 中间人）
+#
+# 构建前提：
+#   cd wren-ui && nvm use 18 && NODE_TLS_REJECT_UNAUTHORIZED=0 node .yarn/releases/yarn-4.5.3.cjs install
+#
+# 构建命令：
+#   DOCKER_BUILDKIT=0 docker build \
+#     --build-arg HTTP_PROXY=http://172.17.0.1:3128 \
+#     --build-arg HTTPS_PROXY=http://172.17.0.1:3128 \
+#     -t wrenai-wren-ui:latest -f Dockerfile.cloud .
+
+FROM node:18-bookworm-slim AS base
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY .yarnrc.yml package.json yarn.lock ./
+COPY .yarn/releases/yarn-4.5.3.cjs .yarn/releases/yarn-4.5.3.cjs
+RUN echo '#!/bin/sh\nexec node /app/.yarn/releases/yarn-4.5.3.cjs "$@"' > /usr/local/bin/yarn && chmod +x /usr/local/bin/yarn
+
+# 直接用宿主机装好的 node_modules
+COPY node_modules ./node_modules
+
+# Build
+COPY public ./public
+COPY src ./src
+COPY .eslintrc.json ./
+COPY .eslintignore ./
+COPY .prettierrc ./
+COPY next.config.js ./
+COPY tsconfig.json ./
+RUN NODE_OPTIONS=--max-old-space-size=4096 yarn build
+
+# Production
+FROM node:18-bookworm-slim AS runner
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+COPY .yarnrc.yml package.json yarn.lock ./
+COPY .yarn/releases/yarn-4.5.3.cjs .yarn/releases/yarn-4.5.3.cjs
+RUN echo '#!/bin/sh\nexec node /app/.yarn/releases/yarn-4.5.3.cjs "$@"' > /usr/local/bin/yarn && chmod +x /usr/local/bin/yarn
+
+COPY --from=0 /app/public ./public
+RUN mkdir .next
+COPY --from=0 /app/.next/standalone ./
+COPY --from=0 /app/.next/static ./.next/static
+COPY migrations ./migrations
+COPY knexfile.js ./knexfile.js
+COPY --from=0 /app/node_modules/knex ./node_modules/knex
+COPY --from=0 /app/node_modules/rechoir ./node_modules/rechoir
+COPY --from=0 /app/node_modules/resolve ./node_modules/resolve
+COPY --from=0 /app/node_modules/is-core-module ./node_modules/is-core-module
+COPY --from=0 /app/node_modules/hasown ./node_modules/hasown
+COPY --from=0 /app/node_modules/function-bind ./node_modules/function-bind
+COPY --from=0 /app/node_modules/interpret ./node_modules/interpret
+COPY --from=0 /app/node_modules/resolve-from ./node_modules/resolve-from
+COPY --from=0 /app/node_modules/tildify ./node_modules/tildify
+COPY --from=0 /app/node_modules/getopts ./node_modules/getopts
+COPY --from=0 /app/node_modules/escalade/sync ./node_modules/escalade/sync
+COPY --from=0 /app/node_modules/.yarn-state.yml ./node_modules/.yarn-state.yml
+
+EXPOSE 3000
+ENV PORT=3000
+CMD yarn knex migrate:latest && HOSTNAME="0.0.0.0" node server.js
