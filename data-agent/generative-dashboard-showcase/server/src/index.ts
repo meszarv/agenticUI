@@ -101,6 +101,29 @@ const resolveMdl = async (input: {
   } as const;
 };
 
+const resolveMdlBestEffort = async (input: {
+  mdl?: string;
+  mdlHash?: string;
+}) => {
+  try {
+    const resolved = await resolveMdl(input);
+    return {
+      ...resolved,
+      available: true as const,
+      warning: null as string | null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      hash: input.mdlHash?.trim() || runtimeConfig.wren.deployId,
+      mdl: undefined,
+      source: 'unavailable',
+      available: false as const,
+      warning: message,
+    };
+  }
+};
+
 app.get('/api/wren/mdl', async (req, res) => {
   try {
     const hash = typeof req.query.hash === 'string' ? req.query.hash : undefined;
@@ -184,10 +207,15 @@ app.post('/api/wren/chart', async (req, res) => {
 app.post('/api/wren/generate-dashboard', async (req, res) => {
   try {
     const payload = generateDashboardSchema.parse(req.body);
-    const resolved = await resolveMdl({
+    const resolved = await resolveMdlBestEffort({
       mdl: payload.mdl,
       mdlHash: payload.mdlHash,
     });
+    if (!resolved.available) {
+      console.warn(
+        `[generate-dashboard] MDL unavailable for hash ${resolved.hash}. Proceeding without recommendation context. ${resolved.warning}`,
+      );
+    }
     const result = await generateDashboard({
       connection: wrenConnection,
       deployId: runtimeConfig.wren.deployId,
@@ -204,11 +232,11 @@ app.post('/api/wren/generate-dashboard', async (req, res) => {
 
 app.post('/api/wren/generate-dashboard/stream', async (req, res) => {
   let payload: z.infer<typeof generateDashboardSchema>;
-  let resolved: Awaited<ReturnType<typeof resolveMdl>>;
+  let resolved: Awaited<ReturnType<typeof resolveMdlBestEffort>>;
 
   try {
     payload = generateDashboardSchema.parse(req.body);
-    resolved = await resolveMdl({
+    resolved = await resolveMdlBestEffort({
       mdl: payload.mdl,
       mdlHash: payload.mdlHash,
     });
@@ -231,6 +259,18 @@ app.post('/api/wren/generate-dashboard/stream', async (req, res) => {
     streamRes.write(`${JSON.stringify(event)}\n`);
     streamRes.flush?.();
   };
+
+  if (!resolved.available) {
+    send({
+      type: 'status',
+      stage: 'mdl',
+      message: 'MDL fetch unavailable; proceeding with ask/chart flow only.',
+      progress: 2,
+    });
+    console.warn(
+      `[generate-dashboard/stream] MDL unavailable for hash ${resolved.hash}. Proceeding without recommendation context. ${resolved.warning}`,
+    );
+  }
 
   try {
     await generateDashboardStream(

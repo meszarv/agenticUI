@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, MouseEvent, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { VegaEmbed } from 'react-vega';
 import { Renderer } from '@openuidev/react-lang';
@@ -28,8 +28,168 @@ const makeEmptyStreamResult = (): GenerateDashboardResponse => ({
   closestQueries: [],
 });
 
+const DEFAULT_INTENT = 'Show a health overview dashboard for network quality by region.';
+
+type DashboardSnapshot = {
+  id: string;
+  intent: string;
+  previousQuestionsText: string;
+  status: string;
+  error: string | null;
+  result: GenerateDashboardResponse | null;
+};
+
+const breadcrumbLabel = (intentText: string, index: number) => {
+  const base = intentText.trim();
+  if (!base) {
+    return index === 0 ? 'Root' : `Detail ${index}`;
+  }
+  return base.length > 36 ? `${base.slice(0, 36)}...` : base;
+};
+
+const MAX_DRILLDOWN_ITEM_LENGTH = 120;
+
+const normalizeClickedItem = (value: string) => {
+  const collapsed = value.replace(/\s+/g, ' ').trim().replace(/^["'`]+|["'`]+$/g, '');
+  if (!collapsed) {
+    return null;
+  }
+  return collapsed.slice(0, MAX_DRILLDOWN_ITEM_LENGTH);
+};
+
+const normalizeHistory = (questions: string[]) => {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const question of questions) {
+    const trimmed = question.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+};
+
+const readPrimitiveValue = (value: unknown) => {
+  if (typeof value === 'string') {
+    return normalizeClickedItem(value);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return normalizeClickedItem(String(value));
+  }
+  return null;
+};
+
+const readDatumValue = (datum: unknown): string | null => {
+  const primitiveValue = readPrimitiveValue(datum);
+  if (primitiveValue) {
+    return primitiveValue;
+  }
+  if (!datum || typeof datum !== 'object') {
+    return null;
+  }
+
+  const objectValue = datum as Record<string, unknown>;
+  const preferredKeys = [
+    'name',
+    'label',
+    'title',
+    'category',
+    'site_name',
+    'site_code',
+    'city',
+    'region',
+    'province',
+    'status',
+    'id',
+    'value',
+  ];
+
+  for (const key of preferredKeys) {
+    if (!(key in objectValue)) {
+      continue;
+    }
+    const preferred = readPrimitiveValue(objectValue[key]);
+    if (preferred) {
+      return preferred;
+    }
+  }
+
+  for (const value of Object.values(objectValue)) {
+    const fallback = readPrimitiveValue(value);
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return null;
+};
+
+const readElementValue = (element: Element) => {
+  const attrCandidates = [
+    element.getAttribute('data-value'),
+    element.getAttribute('data-label'),
+    element.getAttribute('aria-label'),
+    element.getAttribute('title'),
+  ];
+  for (const attrValue of attrCandidates) {
+    const normalized = normalizeClickedItem(attrValue || '');
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLSelectElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLButtonElement ||
+    element instanceof HTMLOptionElement
+  ) {
+    const normalized = normalizeClickedItem(element.value || element.textContent || '');
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return normalizeClickedItem(element.textContent || '');
+};
+
+const extractClickedItem = (event: MouseEvent<HTMLElement>) => {
+  const nativeEvent = event.nativeEvent as Event & { composedPath?: () => EventTarget[] };
+  const path =
+    typeof nativeEvent.composedPath === 'function'
+      ? nativeEvent.composedPath()
+      : event.target
+        ? [event.target as EventTarget]
+        : [];
+  const interactiveSelector =
+    'td,th,[role="cell"],[role="gridcell"],button,a,[data-value],[data-label],[aria-label],svg text';
+
+  for (const node of path) {
+    if (!(node instanceof Element)) {
+      continue;
+    }
+
+    const interactiveElement = node.closest(interactiveSelector);
+    if (interactiveElement) {
+      const elementValue = readElementValue(interactiveElement);
+      if (elementValue) {
+        return elementValue;
+      }
+    }
+
+    const datumValue = readDatumValue((node as Element & { __data__?: unknown }).__data__);
+    if (datumValue) {
+      return datumValue;
+    }
+  }
+
+  return null;
+};
+
 export default function App() {
-  const [intent, setIntent] = useState('Show a health overview dashboard for network quality by region.');
+  const [intent, setIntent] = useState(DEFAULT_INTENT);
   const [previousQuestionsText, setPreviousQuestionsText] = useState('');
   const [maxWidgets, setMaxWidgets] = useState(4);
   const [runtimeConfig, setRuntimeConfig] = useState<RuntimeAppConfig | null>(null);
@@ -38,6 +198,17 @@ export default function App() {
   const [status, setStatus] = useState('Ready');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GenerateDashboardResponse | null>(null);
+  const [breadcrumbTrail, setBreadcrumbTrail] = useState<DashboardSnapshot[]>([
+    {
+      id: 'root',
+      intent: DEFAULT_INTENT,
+      previousQuestionsText: '',
+      status: 'Ready',
+      error: null,
+      result: null,
+    },
+  ]);
+  const [activeBreadcrumbIndex, setActiveBreadcrumbIndex] = useState(0);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const previousQuestions = useMemo(() => {
@@ -66,8 +237,41 @@ export default function App() {
     };
   }, []);
 
-  const handleGenerate = async (event: FormEvent) => {
-    event.preventDefault();
+  useEffect(() => {
+    setBreadcrumbTrail((prev) => {
+      if (activeBreadcrumbIndex < 0 || activeBreadcrumbIndex >= prev.length) {
+        return prev;
+      }
+      const current = prev[activeBreadcrumbIndex];
+      if (
+        current.intent === intent &&
+        current.previousQuestionsText === previousQuestionsText &&
+        current.status === status &&
+        current.error === error &&
+        current.result === result
+      ) {
+        return prev;
+      }
+
+      const next = [...prev];
+      next[activeBreadcrumbIndex] = {
+        ...current,
+        intent,
+        previousQuestionsText,
+        status,
+        error,
+        result,
+      };
+      return next;
+    });
+  }, [activeBreadcrumbIndex, intent, previousQuestionsText, status, error, result]);
+
+  const runDashboardGeneration = async (input: {
+    requestedIntent: string;
+    requestedPreviousQuestions: string[];
+  }) => {
+    const normalizedIntent = input.requestedIntent.trim();
+    const normalizedPreviousQuestions = normalizeHistory(input.requestedPreviousQuestions);
     setError(null);
 
     if (!runtimeConfig?.wren?.hasDeployId) {
@@ -75,7 +279,7 @@ export default function App() {
       return;
     }
 
-    if (!intent.trim()) {
+    if (!normalizedIntent) {
       setError('Intent is required.');
       return;
     }
@@ -91,9 +295,9 @@ export default function App() {
 
       let finalReceived = false;
       let streamFailure: string | null = null;
-      const input = {
-        intent,
-        previousQuestions,
+      const requestInput = {
+        intent: normalizedIntent,
+        previousQuestions: normalizedPreviousQuestions,
         maxWidgets,
       };
 
@@ -157,7 +361,7 @@ export default function App() {
       };
 
       try {
-        await generateDashboardStream(input, {
+        await generateDashboardStream(requestInput, {
           onEvent,
           signal: abortController.signal,
         });
@@ -173,7 +377,7 @@ export default function App() {
           throw streamErr;
         }
         setStatus('Streaming failed. Falling back to standard request...');
-        const dashboard = await generateDashboard(input);
+        const dashboard = await generateDashboard(requestInput);
         setResult(dashboard);
         setStatus(`Generated ${dashboard.widgets.length} widget(s).`);
       }
@@ -190,6 +394,69 @@ export default function App() {
       }
       setBusy(false);
     }
+  };
+
+  const handleGenerate = async (event: FormEvent) => {
+    event.preventDefault();
+    await runDashboardGeneration({
+      requestedIntent: intent,
+      requestedPreviousQuestions: previousQuestions,
+    });
+  };
+
+  const handleBreadcrumbSelect = (index: number) => {
+    if (busy || index === activeBreadcrumbIndex) {
+      return;
+    }
+    const snapshot = breadcrumbTrail[index];
+    if (!snapshot) {
+      return;
+    }
+    setActiveBreadcrumbIndex(index);
+    setIntent(snapshot.intent);
+    setPreviousQuestionsText(snapshot.previousQuestionsText);
+    setStatus(snapshot.status);
+    setError(snapshot.error);
+    setResult(snapshot.result);
+  };
+
+  const handleOpenUiDrilldownClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (busy) {
+      return;
+    }
+    const clickedItem = extractClickedItem(event);
+    if (!clickedItem) {
+      return;
+    }
+    const currentIntent = intent.trim();
+    if (!currentIntent) {
+      return;
+    }
+
+    const updatedPreviousQuestions = normalizeHistory([...previousQuestions, currentIntent]);
+    const nextIntent = `tell me more about ${clickedItem}`;
+    const nextPreviousQuestionsText = updatedPreviousQuestions.join('\n');
+
+    const nextSnapshot: DashboardSnapshot = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      intent: nextIntent,
+      previousQuestionsText: nextPreviousQuestionsText,
+      status: `Drilling into "${clickedItem}"...`,
+      error: null,
+      result: null,
+    };
+    const nextBreadcrumbIndex = activeBreadcrumbIndex + 1;
+    setBreadcrumbTrail((prev) => [...prev.slice(0, activeBreadcrumbIndex + 1), nextSnapshot]);
+    setActiveBreadcrumbIndex(nextBreadcrumbIndex);
+    setIntent(nextIntent);
+    setPreviousQuestionsText(nextPreviousQuestionsText);
+    setStatus(nextSnapshot.status);
+    setError(null);
+    setResult(null);
+    void runDashboardGeneration({
+      requestedIntent: nextIntent,
+      requestedPreviousQuestions: updatedPreviousQuestions,
+    });
   };
 
   const handleCancel = () => {
@@ -291,6 +558,28 @@ export default function App() {
 
         <section className="panel output">
           <h2>Generated Dashboard</h2>
+          <nav className="breadcrumbs" aria-label="Dashboard drilldown breadcrumbs">
+            {breadcrumbTrail.map((snapshot, index) => {
+              const isActive = index === activeBreadcrumbIndex;
+              return (
+                <span key={snapshot.id} className="crumb-wrap">
+                  {isActive ? (
+                    <span className="crumb active">{breadcrumbLabel(snapshot.intent, index)}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="crumb"
+                      onClick={() => handleBreadcrumbSelect(index)}
+                      disabled={busy}
+                    >
+                      {breadcrumbLabel(snapshot.intent, index)}
+                    </button>
+                  )}
+                  {index < breadcrumbTrail.length - 1 ? <span className="crumb-sep">/</span> : null}
+                </span>
+              );
+            })}
+          </nav>
           {!result ? (
             <p className="muted">Generate a dashboard to see widgets here.</p>
           ) : (
@@ -349,7 +638,7 @@ export default function App() {
                           />
                         </div>
                       ) : widget.openUiLang ? (
-                        <div className="chart-frame">
+                        <div className="chart-frame drilldown-frame" onClick={handleOpenUiDrilldownClick}>
                           <Renderer
                             library={openuiLibrary}
                             response={widget.openUiLang}

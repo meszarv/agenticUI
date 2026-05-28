@@ -167,6 +167,48 @@ button.ghost {
   min-height: 75vh;
 }
 
+.breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.crumb-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.crumb {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.crumb:hover {
+  transform: none;
+  text-decoration: underline;
+}
+
+.crumb.active {
+  color: var(--ink);
+  cursor: default;
+  text-decoration: none;
+}
+
+.crumb-sep {
+  color: var(--muted);
+}
+
 .summary {
   display: flex;
   flex-wrap: wrap;
@@ -236,6 +278,19 @@ button.ghost {
   border-radius: 8px;
   padding: 8px;
   background: #fff;
+}
+
+.drilldown-frame td,
+.drilldown-frame th,
+.drilldown-frame [role='cell'],
+.drilldown-frame [role='gridcell'],
+.drilldown-frame svg text,
+.drilldown-frame svg path,
+.drilldown-frame svg rect,
+.drilldown-frame svg circle,
+.drilldown-frame [data-value],
+.drilldown-frame [data-label] {
+  cursor: pointer;
 }
 
 pre {

@@ -125,6 +125,11 @@ export class WrenError extends Error {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.WREN_TIMEOUT_MS ?? 180000);
 const DEFAULT_POLL_INTERVAL_MS = Number(process.env.WREN_POLL_INTERVAL_MS ?? 1000);
+const DEFAULT_SEMANTICS_TTL_MS = Number(
+  process.env.WREN_SEMANTICS_PREPARE_TTL_MS ?? 10 * 60 * 1000,
+);
+const semanticsPreparedAt = new Map<string, number>();
+const semanticsInFlight = new Map<string, Promise<void>>();
 
 const normalizeBaseUrl = (baseUrl: string) => baseUrl.replace(/\/$/, '');
 
@@ -395,6 +400,45 @@ export const prepareSemantics = async (input: {
   } catch (error) {
     throw new WrenError(`Failed to prepare semantics: ${errorMessage(error)}`);
   }
+};
+
+const ensureSemanticsPrepared = async (input: {
+  connection: WrenConnection;
+  mdl?: string;
+  mdlHash: string;
+}) => {
+  const mdl = input.mdl?.trim();
+  if (!mdl) {
+    return false;
+  }
+
+  const now = Date.now();
+  const preparedAt = semanticsPreparedAt.get(input.mdlHash);
+  if (preparedAt && now - preparedAt < DEFAULT_SEMANTICS_TTL_MS) {
+    return false;
+  }
+
+  const inFlight = semanticsInFlight.get(input.mdlHash);
+  if (inFlight) {
+    await inFlight;
+    return true;
+  }
+
+  const run = (async () => {
+    await prepareSemantics({
+      connection: input.connection,
+      mdl,
+      mdlHash: input.mdlHash,
+    });
+    semanticsPreparedAt.set(input.mdlHash, Date.now());
+  })()
+    .finally(() => {
+      semanticsInFlight.delete(input.mdlHash);
+    });
+
+  semanticsInFlight.set(input.mdlHash, run);
+  await run;
+  return true;
 };
 
 export const recommendQuestions = async (input: {
@@ -689,6 +733,28 @@ const generateDashboardInternal = async (
 ): Promise<GenerateDashboardResult> => {
   const { connection, deployId, intent, mdl, previousQuestions = [], maxWidgets = 4 } = input;
   const widgetLimit = Math.max(1, maxWidgets);
+
+  if (mdl?.trim()) {
+    await emitDashboardEvent(onEvent, {
+      type: 'status',
+      stage: 'semantics',
+      message: 'Preparing semantic context...',
+      progress: 2,
+    });
+    const prepared = await ensureSemanticsPrepared({
+      connection,
+      mdl,
+      mdlHash: deployId,
+    });
+    if (prepared) {
+      await emitDashboardEvent(onEvent, {
+        type: 'status',
+        stage: 'semantics',
+        message: 'Semantic context ready.',
+        progress: 4,
+      });
+    }
+  }
 
   await emitDashboardEvent(onEvent, {
     type: 'status',

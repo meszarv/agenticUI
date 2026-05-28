@@ -42,11 +42,14 @@ const run = async () => {
       });
       intent = recommendation.questions[0]?.question;
     } catch (error) {
-      throw new Error(
-        'Could not auto-discover an intent from recommendation API. ' +
-          `Set GD_TEST_INTENT manually. Original error: ${error instanceof Error ? error.message : String(error)}`,
+      console.warn(
+        'Warning: could not auto-discover an intent from recommendation API. ' +
+          `Falling back to "show sites". Original error: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
       );
     }
+    intent ||= 'show sites';
   }
   assert.equal(typeof intent, 'string');
   assert.ok(intent.length > 0, 'Intent should not be empty');
