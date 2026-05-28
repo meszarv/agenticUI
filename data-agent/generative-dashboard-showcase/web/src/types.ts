@@ -66,3 +66,41 @@ export type GenerateDashboardResponse = {
   widgets: DashboardWidget[];
   closestQueries: ClosestQuery[];
 };
+
+export type DashboardStreamEvent =
+  | {
+      type: 'status';
+      stage: string;
+      message: string;
+      progress?: number;
+    }
+  | {
+      type: 'ask';
+      ask: AskResult;
+    }
+  | {
+      type: 'recommendations';
+      recommendations: Array<{
+        question: string;
+        category: string;
+        sql: string;
+      }>;
+    }
+  | {
+      type: 'closestQueries';
+      closestQueries: ClosestQuery[];
+    }
+  | {
+      type: 'widget';
+      index: number;
+      widget: DashboardWidget;
+    }
+  | {
+      type: 'final';
+      result: GenerateDashboardResponse;
+    }
+  | {
+      type: 'error';
+      message: string;
+      details?: unknown;
+    };

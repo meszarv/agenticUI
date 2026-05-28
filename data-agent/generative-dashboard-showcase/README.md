@@ -24,6 +24,7 @@ The BFF exposes these under:
 - `POST /api/wren/recommend`
 - `POST /api/wren/chart`
 - `POST /api/wren/generate-dashboard` (orchestrated intent -> widgets)
+- `POST /api/wren/generate-dashboard/stream` (NDJSON stream for progressive widget rendering)
 
 ## Run
 
@@ -79,6 +80,7 @@ Network notes:
 - generate chart for primary SQL,
 - auto-resolve MDL (from request or Wren API),
 - optionally call `question-recommendations` and generate more widgets.
+- render widgets incrementally as stream events arrive from the backend.
 
 ## Notes
 

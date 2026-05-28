@@ -1,10 +1,10 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { VegaEmbed } from 'react-vega';
 import { Renderer } from '@openuidev/react-lang';
 import { ThemeProvider, openuiLibrary } from '@openuidev/react-ui';
-import { generateDashboard, getRuntimeConfig } from './api';
-import { GenerateDashboardResponse, RuntimeAppConfig } from './types';
+import { generateDashboard, generateDashboardStream, getRuntimeConfig } from './api';
+import { DashboardStreamEvent, GenerateDashboardResponse, RuntimeAppConfig } from './types';
 
 const extractError = (error: unknown) => {
   if (axios.isAxiosError(error)) {
@@ -17,6 +17,17 @@ const extractError = (error: unknown) => {
   return String(error);
 };
 
+const makeEmptyStreamResult = (): GenerateDashboardResponse => ({
+  ask: {
+    queryId: '',
+    status: 'running',
+    candidates: [],
+  },
+  recommendations: [],
+  widgets: [],
+  closestQueries: [],
+});
+
 export default function App() {
   const [intent, setIntent] = useState('Show a health overview dashboard for network quality by region.');
   const [previousQuestionsText, setPreviousQuestionsText] = useState('');
@@ -27,6 +38,7 @@ export default function App() {
   const [status, setStatus] = useState('Ready');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GenerateDashboardResponse | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const previousQuestions = useMemo(() => {
     return previousQuestionsText
@@ -48,6 +60,12 @@ export default function App() {
     loadConfig();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+    };
+  }, []);
+
   const handleGenerate = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
@@ -62,29 +80,129 @@ export default function App() {
       return;
     }
 
+    streamAbortRef.current?.abort();
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
+
     try {
       setBusy(true);
-      setStatus('Generating dashboard widgets...');
-      const dashboard = await generateDashboard({
+      setResult(makeEmptyStreamResult());
+      setStatus('Starting dashboard generation...');
+
+      let finalReceived = false;
+      let streamFailure: string | null = null;
+      const input = {
         intent,
         previousQuestions,
         maxWidgets,
-      });
-      setResult(dashboard);
-      setStatus(`Generated ${dashboard.widgets.length} widget(s).`);
+      };
+
+      const onEvent = (streamEvent: DashboardStreamEvent) => {
+        switch (streamEvent.type) {
+          case 'status': {
+            setStatus(streamEvent.message);
+            return;
+          }
+          case 'ask': {
+            setResult((prev) => ({
+              ...(prev || makeEmptyStreamResult()),
+              ask: streamEvent.ask,
+            }));
+            return;
+          }
+          case 'recommendations': {
+            setResult((prev) => ({
+              ...(prev || makeEmptyStreamResult()),
+              recommendations: streamEvent.recommendations,
+            }));
+            return;
+          }
+          case 'closestQueries': {
+            setResult((prev) => ({
+              ...(prev || makeEmptyStreamResult()),
+              closestQueries: streamEvent.closestQueries,
+            }));
+            return;
+          }
+          case 'widget': {
+            setResult((prev) => {
+              const base = prev || makeEmptyStreamResult();
+              const widgets = [...base.widgets];
+              const existingIndex = widgets.findIndex((item) => item.sql === streamEvent.widget.sql);
+              if (existingIndex >= 0) {
+                widgets[existingIndex] = streamEvent.widget;
+              } else {
+                widgets.push(streamEvent.widget);
+              }
+              return {
+                ...base,
+                widgets,
+              };
+            });
+            setStatus(`Generated ${streamEvent.index + 1} widget(s)...`);
+            return;
+          }
+          case 'final': {
+            finalReceived = true;
+            setResult(streamEvent.result);
+            setStatus(`Generated ${streamEvent.result.widgets.length} widget(s).`);
+            return;
+          }
+          case 'error': {
+            streamFailure = streamEvent.details
+              ? `${streamEvent.message} (${JSON.stringify(streamEvent.details)})`
+              : streamEvent.message;
+          }
+        }
+      };
+
+      try {
+        await generateDashboardStream(input, {
+          onEvent,
+          signal: abortController.signal,
+        });
+
+        if (streamFailure) {
+          throw new Error(streamFailure);
+        }
+        if (!finalReceived) {
+          throw new Error('Dashboard stream ended before final result.');
+        }
+      } catch (streamErr) {
+        if ((streamErr as Error).name === 'AbortError') {
+          throw streamErr;
+        }
+        setStatus('Streaming failed. Falling back to standard request...');
+        const dashboard = await generateDashboard(input);
+        setResult(dashboard);
+        setStatus(`Generated ${dashboard.widgets.length} widget(s).`);
+      }
     } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        setStatus('Generation cancelled.');
+        return;
+      }
       setStatus('Dashboard generation failed.');
       setError(extractError(err));
     } finally {
+      if (streamAbortRef.current === abortController) {
+        streamAbortRef.current = null;
+      }
       setBusy(false);
     }
+  };
+
+  const handleCancel = () => {
+    if (!busy) {
+      return;
+    }
+    streamAbortRef.current?.abort();
   };
 
   return (
     <div className="page">
       <header className="hero">
-        <h1>WrenAI Generative Dashboard Showcase</h1>
-        <p>React UI runtime + WrenAI schema intelligence via API only</p>
+        <h1>Generative Dashboard Showcase</h1>
       </header>
 
       <div className="layout">
@@ -149,9 +267,16 @@ export default function App() {
                 onChange={(e) => setMaxWidgets(Number(e.target.value))}
               />
             </label>
-            <button type="submit" disabled={busy}>
-              {busy ? 'Generating...' : 'Generate Dashboard'}
-            </button>
+            <div className="inline-actions">
+              <button type="submit" disabled={busy}>
+                {busy ? 'Generating...' : 'Generate Dashboard'}
+              </button>
+              {busy ? (
+                <button type="button" className="ghost" onClick={handleCancel}>
+                  Cancel
+                </button>
+              ) : null}
+            </div>
           </form>
 
           <div className="status">

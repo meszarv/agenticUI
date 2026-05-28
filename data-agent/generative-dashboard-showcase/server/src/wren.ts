@@ -75,6 +75,47 @@ export type GenerateDashboardInput = {
   previousQuestions?: string[];
 };
 
+export type GenerateDashboardResult = {
+  ask: AskResult;
+  recommendations: RecommendationQuestion[];
+  widgets: DashboardWidget[];
+  closestQueries: ClosestQuery[];
+};
+
+export type DashboardStreamEvent =
+  | {
+      type: 'status';
+      stage: string;
+      message: string;
+      progress?: number;
+    }
+  | {
+      type: 'ask';
+      ask: AskResult;
+    }
+  | {
+      type: 'recommendations';
+      recommendations: RecommendationQuestion[];
+    }
+  | {
+      type: 'closestQueries';
+      closestQueries: ClosestQuery[];
+    }
+  | {
+      type: 'widget';
+      index: number;
+      widget: DashboardWidget;
+    }
+  | {
+      type: 'final';
+      result: GenerateDashboardResult;
+    }
+  | {
+      type: 'error';
+      message: string;
+      details?: unknown;
+    };
+
 export class WrenError extends Error {
   constructor(message: string, public readonly details?: unknown) {
     super(message);
@@ -523,6 +564,36 @@ const normalizeText = (value: unknown) => {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 };
 
+const hasUsableEncodingFields = (encoding: unknown) => {
+  if (!encoding || typeof encoding !== 'object') {
+    return true;
+  }
+  const channels = Object.values(encoding as Record<string, unknown>);
+  const fieldChannels = channels.filter((channel): channel is Record<string, unknown> => {
+    if (!channel || typeof channel !== 'object') {
+      return false;
+    }
+    return Object.prototype.hasOwnProperty.call(channel, 'field');
+  });
+
+  if (!fieldChannels.length) {
+    return true;
+  }
+
+  return fieldChannels.some((channel) => Boolean(normalizeText(channel.field)));
+};
+
+const hasUsableChartPayload = (chart: ChartResult | undefined) => {
+  if (!chart?.chartSchema || typeof chart.chartSchema !== 'object') {
+    return false;
+  }
+  if (!normalizeText(chart.chartType)) {
+    return false;
+  }
+  const schema = chart.chartSchema as Record<string, unknown>;
+  return hasUsableEncodingFields(schema.encoding);
+};
+
 const clarificationDescription = (input: {
   ask: AskResult;
   category?: string;
@@ -542,21 +613,96 @@ const clarificationDescription = (input: {
   return 'Closest query inferred from your intent and available schema.';
 };
 
-export const generateDashboard = async (
+type DashboardEventEmitter = (event: DashboardStreamEvent) => void | Promise<void>;
+
+const emitDashboardEvent = async (
+  emitter: DashboardEventEmitter | undefined,
+  event: DashboardStreamEvent,
+) => {
+  if (!emitter) {
+    return;
+  }
+  await emitter(event);
+};
+
+const buildDashboardWidget = async (input: {
+  connection: WrenConnection;
+  question: string;
+  sql: string;
+  category?: string;
+}): Promise<DashboardWidget> => {
+  const { connection, question, sql, category } = input;
+  let chart: ChartResult | undefined;
+  let openUi:
+    | {
+        openUiLang: string;
+        dataPreview: SqlDataPreview;
+      }
+    | undefined;
+  const tryGenerateOpenUi = async (attempts: number) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await generateOpenUiLangFromSql({
+          connection,
+          question,
+          sql,
+        });
+      } catch {
+        // ignore and retry
+      }
+    }
+    return undefined;
+  };
+
+  try {
+    chart = await generateChart({
+      connection,
+      question,
+      sql,
+    });
+    if (!hasUsableChartPayload(chart)) {
+      openUi = await tryGenerateOpenUi(2);
+      if (openUi) {
+        chart = undefined;
+      }
+    }
+  } catch {
+    openUi = await tryGenerateOpenUi(1);
+  }
+
+  return {
+    title: question,
+    question,
+    sql,
+    chartType: chart?.chartType,
+    chartSchema: chart?.chartSchema,
+    reasoning: chart?.reasoning,
+    category,
+    openUiLang: openUi?.openUiLang,
+    dataPreview: openUi?.dataPreview,
+  };
+};
+
+const generateDashboardInternal = async (
   input: GenerateDashboardInput,
-): Promise<{
-  ask: AskResult;
-  recommendations: RecommendationQuestion[];
-  widgets: DashboardWidget[];
-  closestQueries: ClosestQuery[];
-}> => {
+  onEvent?: DashboardEventEmitter,
+): Promise<GenerateDashboardResult> => {
   const { connection, deployId, intent, mdl, previousQuestions = [], maxWidgets = 4 } = input;
+  const widgetLimit = Math.max(1, maxWidgets);
+
+  await emitDashboardEvent(onEvent, {
+    type: 'status',
+    stage: 'ask',
+    message: 'Analyzing intent and generating SQL candidates...',
+    progress: 5,
+  });
 
   const ask = await askIntent({
     connection,
     deployId,
     query: intent,
   });
+  await emitDashboardEvent(onEvent, { type: 'ask', ask });
 
   let recommendations: RecommendationQuestion[] = [];
   let closestQueries: ClosestQuery[] = [];
@@ -566,7 +712,19 @@ export const generateDashboard = async (
 
   if (ask.candidates.length) {
     primarySql = ask.candidates[0].sql;
+    await emitDashboardEvent(onEvent, {
+      type: 'status',
+      stage: 'ask',
+      message: 'Primary SQL candidate found.',
+      progress: 18,
+    });
   } else if (mdl) {
+    await emitDashboardEvent(onEvent, {
+      type: 'status',
+      stage: 'fallback',
+      message: 'No direct SQL candidate. Searching closest query alternatives...',
+      progress: 18,
+    });
     const desiredClosestCount = 4;
     const recommendationPool: RecommendationQuestion[] = [];
     const recommendationSeen = new Set<string>();
@@ -574,11 +732,17 @@ export const generateDashboard = async (
     const seedHistory = [...previousQuestions, intent];
 
     for (let attempt = 0; attempt < 3 && recommendationPool.length < desiredClosestCount; attempt += 1) {
+      await emitDashboardEvent(onEvent, {
+        type: 'status',
+        stage: 'fallback',
+        message: `Recommendation fallback attempt ${attempt + 1}/3...`,
+        progress: 20 + attempt * 8,
+      });
       const recommendationResult = await recommendQuestions({
         connection,
         mdl,
         previousQuestions: seedHistory,
-        maxQuestions: Math.max(desiredClosestCount, maxWidgets),
+        maxQuestions: Math.max(desiredClosestCount, widgetLimit),
         maxCategories: Math.min(5, Math.max(2, desiredClosestCount)),
       });
       recommendationResultRaw = recommendationResult.raw;
@@ -594,9 +758,23 @@ export const generateDashboard = async (
     }
 
     recommendations = recommendationPool;
+    if (recommendations.length) {
+      await emitDashboardEvent(onEvent, {
+        type: 'recommendations',
+        recommendations,
+      });
+    }
+
     const seeded = recommendations.slice(0, 10);
     const seen = new Set<string>();
-    for (const rec of seeded) {
+    for (let i = 0; i < seeded.length; i += 1) {
+      const rec = seeded[i];
+      await emitDashboardEvent(onEvent, {
+        type: 'status',
+        stage: 'fallback',
+        message: `Evaluating closest query option ${i + 1}/${seeded.length}...`,
+        progress: 42,
+      });
       try {
         const recAsk = await askIntent({
           connection,
@@ -644,6 +822,12 @@ export const generateDashboard = async (
         description: `Closest ${rec.category.toLowerCase()} query derived from recommendation fallback.`,
       }));
     }
+    if (closestQueries.length) {
+      await emitDashboardEvent(onEvent, {
+        type: 'closestQueries',
+        closestQueries,
+      });
+    }
 
     const fallback = closestQueries[0];
     if (!fallback) {
@@ -659,132 +843,104 @@ export const generateDashboard = async (
     throw new WrenError('No SQL candidates returned from ask endpoint', ask.raw);
   }
 
-  let baseChart: ChartResult | undefined;
-  let baseOpenUi:
-    | {
-        openUiLang: string;
-        dataPreview: SqlDataPreview;
-      }
-    | undefined;
-  try {
-    baseChart = await generateChart({
-      connection,
-      question: primaryQuestion,
-      sql: primarySql,
+  const widgets: DashboardWidget[] = [];
+  const seenSql = new Set<string>();
+  const pushWidget = async (widget: DashboardWidget) => {
+    if (!widget.sql || seenSql.has(widget.sql) || widgets.length >= widgetLimit) {
+      return;
+    }
+    seenSql.add(widget.sql);
+    widgets.push(widget);
+    await emitDashboardEvent(onEvent, {
+      type: 'widget',
+      index: widgets.length - 1,
+      widget,
     });
-    if (!baseChart.chartSchema) {
-      baseOpenUi = await generateOpenUiLangFromSql({
-        connection,
-        question: primaryQuestion,
-        sql: primarySql,
-      });
-    }
-  } catch {
-    try {
-      baseOpenUi = await generateOpenUiLangFromSql({
-        connection,
-        question: primaryQuestion,
-        sql: primarySql,
-      });
-    } catch {
-      baseOpenUi = undefined;
-    }
-  }
+  };
 
-  const widgets: DashboardWidget[] = [
-    {
-      title: primaryQuestion,
-      question: primaryQuestion,
-      sql: primarySql,
-      chartType: baseChart?.chartType,
-      chartSchema: baseChart?.chartSchema,
-      reasoning: baseChart?.reasoning,
-      category: primaryCategory,
-      openUiLang: baseOpenUi?.openUiLang,
-      dataPreview: baseOpenUi?.dataPreview,
-    },
-  ];
+  await emitDashboardEvent(onEvent, {
+    type: 'status',
+    stage: 'primary-widget',
+    message: 'Generating primary widget...',
+    progress: 55,
+  });
+  const primaryWidget = await buildDashboardWidget({
+    connection,
+    question: primaryQuestion,
+    sql: primarySql,
+    category: primaryCategory,
+  });
+  await pushWidget(primaryWidget);
 
-  if (mdl && maxWidgets > 1) {
+  if (mdl && widgetLimit > 1) {
     if (!recommendations.length) {
+      await emitDashboardEvent(onEvent, {
+        type: 'status',
+        stage: 'recommendations',
+        message: 'Generating additional widget recommendations...',
+        progress: 65,
+      });
       const recommendationResult = await recommendQuestions({
         connection,
         mdl,
         previousQuestions: [...previousQuestions, intent],
-        maxQuestions: Math.max(1, maxWidgets - 1),
-        maxCategories: Math.min(3, Math.max(1, maxWidgets - 1)),
+        maxQuestions: Math.max(1, widgetLimit - 1),
+        maxCategories: Math.min(3, Math.max(1, widgetLimit - 1)),
       });
       recommendations = recommendationResult.questions;
+      await emitDashboardEvent(onEvent, {
+        type: 'recommendations',
+        recommendations,
+      });
     }
 
-    const selected = recommendations.slice(0, maxWidgets - 1);
-    for (const rec of selected) {
-      try {
-        const chart = await generateChart({
-          connection,
-          question: rec.question,
-          sql: rec.sql,
-        });
-        let openUi:
-          | {
-              openUiLang: string;
-              dataPreview: SqlDataPreview;
-            }
-          | undefined;
-        if (!chart.chartSchema) {
-          try {
-            openUi = await generateOpenUiLangFromSql({
-              connection,
-              question: rec.question,
-              sql: rec.sql,
-            });
-          } catch {
-            openUi = undefined;
-          }
-        }
-        widgets.push({
-          title: rec.question,
-          question: rec.question,
-          sql: rec.sql,
-          chartType: chart.chartType,
-          chartSchema: chart.chartSchema,
-          reasoning: chart.reasoning,
-          category: rec.category,
-          openUiLang: openUi?.openUiLang,
-          dataPreview: openUi?.dataPreview,
-        });
-      } catch {
-        let openUi:
-          | {
-              openUiLang: string;
-              dataPreview: SqlDataPreview;
-            }
-          | undefined;
-        try {
-          openUi = await generateOpenUiLangFromSql({
-            connection,
-            question: rec.question,
-            sql: rec.sql,
-          });
-        } catch {
-          openUi = undefined;
-        }
-        widgets.push({
-          title: rec.question,
-          question: rec.question,
-          sql: rec.sql,
-          category: rec.category,
-          openUiLang: openUi?.openUiLang,
-          dataPreview: openUi?.dataPreview,
-        });
-      }
+    const selected = recommendations.slice(0, Math.max(0, widgetLimit - 1));
+    for (let i = 0; i < selected.length; i += 1) {
+      const rec = selected[i];
+      await emitDashboardEvent(onEvent, {
+        type: 'status',
+        stage: 'widget',
+        message: `Generating widget ${i + 2} of ${Math.min(widgetLimit, selected.length + 1)}...`,
+        progress: 72 + Math.round(((i + 1) / Math.max(1, selected.length)) * 22),
+      });
+      const widget = await buildDashboardWidget({
+        connection,
+        question: rec.question,
+        sql: rec.sql,
+        category: rec.category,
+      });
+      await pushWidget(widget);
     }
   }
 
   return {
     ask,
     recommendations,
-    widgets: uniqueBySql(widgets).slice(0, maxWidgets),
+    widgets: uniqueBySql(widgets).slice(0, widgetLimit),
     closestQueries,
   };
+};
+
+export const generateDashboard = async (
+  input: GenerateDashboardInput,
+): Promise<GenerateDashboardResult> => {
+  return generateDashboardInternal(input);
+};
+
+export const generateDashboardStream = async (
+  input: GenerateDashboardInput,
+  onEvent: DashboardEventEmitter,
+): Promise<GenerateDashboardResult> => {
+  const result = await generateDashboardInternal(input, onEvent);
+  await emitDashboardEvent(onEvent, {
+    type: 'status',
+    stage: 'done',
+    message: `Completed ${result.widgets.length} widget(s).`,
+    progress: 100,
+  });
+  await emitDashboardEvent(onEvent, {
+    type: 'final',
+    result,
+  });
+  return result;
 };

@@ -7,9 +7,11 @@ import {
   askIntent,
   generateChart,
   generateDashboard,
+  generateDashboardStream,
   prepareSemantics,
   recommendQuestions,
 } from './wren.js';
+import type { DashboardStreamEvent } from './wren.js';
 import { fetchMdlFromWrenApi } from './mdl.js';
 import { loadRuntimeConfig, toWrenConnection } from './runtimeConfig.js';
 
@@ -197,6 +199,74 @@ app.post('/api/wren/generate-dashboard', async (req, res) => {
     res.json(result);
   } catch (error) {
     handleError(error, res);
+  }
+});
+
+app.post('/api/wren/generate-dashboard/stream', async (req, res) => {
+  let payload: z.infer<typeof generateDashboardSchema>;
+  let resolved: Awaited<ReturnType<typeof resolveMdl>>;
+
+  try {
+    payload = generateDashboardSchema.parse(req.body);
+    resolved = await resolveMdl({
+      mdl: payload.mdl,
+      mdlHash: payload.mdlHash,
+    });
+  } catch (error) {
+    handleError(error, res);
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+  const streamRes = res as express.Response & { flush?: () => void };
+
+  const send = (event: DashboardStreamEvent) => {
+    if (streamRes.writableEnded || streamRes.destroyed) {
+      return;
+    }
+    streamRes.write(`${JSON.stringify(event)}\n`);
+    streamRes.flush?.();
+  };
+
+  try {
+    await generateDashboardStream(
+      {
+        connection: wrenConnection,
+        deployId: runtimeConfig.wren.deployId,
+        intent: payload.intent,
+        maxWidgets: payload.maxWidgets,
+        mdl: resolved.mdl,
+        previousQuestions: payload.previousQuestions,
+      },
+      send,
+    );
+  } catch (error) {
+    if (error instanceof WrenError) {
+      send({
+        type: 'error',
+        message: error.message,
+        details: error.details ?? null,
+      });
+    } else if (error instanceof Error) {
+      send({
+        type: 'error',
+        message: error.message,
+      });
+    } else {
+      send({
+        type: 'error',
+        message: 'Unknown error',
+        details: error,
+      });
+    }
+  } finally {
+    if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
   }
 });
 
